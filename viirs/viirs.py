@@ -4,13 +4,13 @@ import random
 from collections import defaultdict
 from datetime import datetime
 from multiprocessing import Pool
+from pprint import pprint
 from typing import Iterable, List
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import s3fs
-from pprint import pprint
 from netCDF4 import Dataset
 from osgeo import gdal, ogr, osr
 from scipy.spatial import ConvexHull
@@ -19,28 +19,32 @@ from tqdm import tqdm
 
 
 class ViirsPoint:
-    def __init__(self, lat:float, lon:float, brightness:float, frp:float, date:str) -> None:
+    def __init__(
+        self, lat: float, lon: float, brightness: float, frp: float, date: str
+    ) -> None:
         self.lat = lat
         self.lon = lon
         self.brightness = brightness
         self.frp = frp
         self.date: datetime = datetime.strptime(date, "%Y/%m/%d %H%M")
-        self.key:None|int = None
+        self.key: None | int = None
 
     @classmethod
-    def parse_feature(cls, feature:str):
+    def parse_feature(cls, feature: str):
         properties = json.loads(feature)["properties"]
         date = f"{properties['ACQ_DATE']} {properties['ACQ_TIME']}"
         lat = properties["LATITUDE"]
         lon = properties["LONGITUDE"]
-        bri = properties["BRIGHT_TI5"]
+        # bri = properties["BRIGHTNESS"]
         frp = properties["FRP"]
 
-        return cls(lat, lon, bri, frp, date)
+        return cls(lat, lon, 0, frp, date)
 
 
 class ViirsDataset:
-    def __init__(self, dir_location: str, eps:float=0.075, min_samples:int=3) -> None:
+    def __init__(
+        self, dir_location: str, eps: float = 0.01, min_samples: int = 4
+    ) -> None:
         self.fs = s3fs.S3FileSystem(anon=True)
 
         file = ogr.Open(dir_location)
@@ -60,9 +64,13 @@ class ViirsDataset:
         self.unique_dates = set([p.date for p in self.data_points])
 
     def fit(self, date: datetime):
-        self.filtered_data_points = list(filter(lambda x: x.date == date, self.data_points))
+        self.filtered_data_points = list(
+            filter(lambda x: x.date == date, self.data_points)
+        )
         tmp_data = [[x.lat, x.lon] for x in self.filtered_data_points]
-        self._db = DBSCAN(eps=self.eps, min_samples=self.min_samples, algorithm="brute").fit(tmp_data)
+        self._db = DBSCAN(
+            eps=self.eps, min_samples=self.min_samples, algorithm="auto"
+        ).fit(tmp_data)
 
     def parse_filename(self, filename: str) -> dict:
         if filename.startswith("OR_"):
@@ -94,7 +102,7 @@ class ViirsDataset:
         file_path = self.__process_band_file(file)
         self.__convert_to_tiff(file_path)
 
-    def __get_band_file(self, dir_path:str, band:int):
+    def __get_band_file(self, dir_path: str, band: int):
         raster_band = None
         for file in os.listdir(dir_path):
             if "output" in file:
@@ -116,7 +124,7 @@ class ViirsDataset:
         lon, lat, _ = transform_epsg.TransformPoint(lat, lon)
         return lon, lat
 
-    def __patchify_file(self, file, rand_x:int, rand_y:int, save_dir, win_size=32):
+    def __patchify_file(self, file, rand_x: int, rand_y: int, save_dir, win_size=32):
         for idx, poly in enumerate(self.__polygons):
             lon, lat = poly.Centroid().GetX(), poly.Centroid().GetY()
 
@@ -127,18 +135,20 @@ class ViirsDataset:
             pixelWidth = transform[1]
             pixelHeight = -transform[5]
 
-            col = (int((lon - xOrigin) / pixelWidth)) - win_size/2 - 1
-            row = (int((yOrigin - lat) / pixelHeight)) - win_size/2 - 1
+            col = (int((lon - xOrigin) / pixelWidth)) - win_size / 2 - 1
+            row = (int((yOrigin - lat) / pixelHeight)) - win_size / 2 - 1
 
             __save_dir = os.path.join(save_dir, str(idx))
             if not os.path.exists(__save_dir):
                 os.mkdir(__save_dir)
 
-            window = (col+rand_x, row+rand_y, win_size, win_size)
-            save_file = os.path.join(__save_dir, f"{file.split('/')[-1].split('.')[0]}_{idx}.tiff" )
+            window = (col + rand_x, row + rand_y, win_size, win_size)
+            save_file = os.path.join(
+                __save_dir, f"{file.split('/')[-1].split('.')[0]}_{idx}.tiff"
+            )
             gdal.Translate(save_file, file, srcWin=window)
 
-    def patch(self, date:datetime, win_size=32):
+    def patch(self, date: datetime, win_size=32):
         if len(self.__polygons) == 0:
             return
 
@@ -146,17 +156,24 @@ class ViirsDataset:
         if not os.path.exists(patches_dir):
             os.mkdir(patches_dir)
 
-        save_dir = os.path.join(patches_dir, str(date)) 
+        save_dir = os.path.join(patches_dir, str(date))
         if not os.path.exists(save_dir):
             os.mkdir(save_dir)
 
-        x_random = int(random.uniform(-1 * (win_size // 3), win_size // 3))
+        x_random = int(random.uniform(0, win_size // 10))
+        # x_random = 5
         y_random = int(random.uniform(-1 * (win_size // 3), win_size // 3))
 
         for file in os.listdir(self.download_dir):
-            self.__patchify_file(os.path.join(self.download_dir, file), x_random, y_random, save_dir, win_size)
+            self.__patchify_file(
+                os.path.join(self.download_dir, file),
+                x_random,
+                y_random,
+                save_dir,
+                win_size,
+            )
 
-    def __clean_up(self, dir:str):
+    def __clean_up(self, dir: str):
         if not os.path.exists(dir):
             return
 
@@ -171,7 +188,9 @@ class ViirsDataset:
         projection = raster_layer.GetProjection()
         geotransform = raster_layer.GetGeoTransform()
 
-        target_layer = gdal.GetDriverByName("MEM").Create("", cols, rows, 1, gdal.GDT_Byte)
+        target_layer = gdal.GetDriverByName("MEM").Create(
+            "", cols, rows, 1, gdal.GDT_Byte
+        )
         target_layer.SetProjection(projection)
         target_layer.SetGeoTransform(geotransform)
 
@@ -179,23 +198,31 @@ class ViirsDataset:
         mem_ds = mem_driver.CreateDataSource("mem_data_source")
         InSR = osr.SpatialReference()
         InSR.SetFromUserInput("ESRI:102498")
-        mem_layer = mem_ds.CreateLayer("multipolygon", geom_type=ogr.wkbMultiPolygon, srs=InSR)
+        mem_layer = mem_ds.CreateLayer(
+            "multipolygon", geom_type=ogr.wkbMultiPolygon, srs=InSR
+        )
         multipolygon = ogr.Geometry(ogr.wkbMultiPolygon)
 
         ds = defaultdict(list)
         for idx, p in enumerate(self._db.labels_):
             ds[p].append(idx)
+        pprint(ds)
 
         self.__polygons = []
         for k, v in ds.items():
             if k == -1:
                 continue
 
-            polygon_points = [[self.filtered_data_points[x].lon, self.filtered_data_points[x].lat] for x in v]
+            polygon_points = [
+                [self.filtered_data_points[x].lon, self.filtered_data_points[x].lat]
+                for x in v
+            ]
 
             if len(polygon_points) > 0:
                 hull = ConvexHull(polygon_points)
                 ring = ogr.Geometry(ogr.wkbLinearRing)
+                print("POINTS: ", polygon_points)
+
                 for p in hull.vertices:
                     lon = polygon_points[p][0]
                     lat = polygon_points[p][1]
@@ -209,20 +236,27 @@ class ViirsDataset:
                     lon, lat = self.__convert_WSG__(lat, lon)
                     ring.AddPoint(lon, lat)
 
-                poly = ogr.Geometry(ogr.wkbPolygon)
-                poly.AddGeometry(ring)
-                self.__polygons.append(poly)
-                multipolygon.AddGeometry(poly)
+                    poly = ogr.Geometry(ogr.wkbPolygon)
+
+                    poly.AddGeometry(ring)
+                    self.__polygons.append(poly)
+                    multipolygon.AddGeometry(poly)
 
         feature_defn = mem_layer.GetLayerDefn()
         feature = ogr.Feature(feature_defn)
         print(multipolygon)
         feature.SetGeometry(multipolygon)
         mem_layer.CreateFeature(feature)
-        gdal.RasterizeLayer(target_layer, [1], mem_layer, burn_values=[255], options=["ALL_TOUCHED=TRUE"])
+        gdal.RasterizeLayer(
+            target_layer,
+            [1],
+            mem_layer,
+            burn_values=[255],
+            options=["ALL_TOUCHED=TRUE"],
+        )
         gdal.Translate(f"{dir_path}/output.tiff", target_layer, format="GTiff")
-        
-    def process_dir(self, dir_path:str):
+
+    def process_dir(self, dir_path: str):
         with Pool() as pp:
             files = os.listdir(dir_path)
             files_paths = [os.path.join(dir_path, file) for file in files]
@@ -292,7 +326,7 @@ class ViirsDataset:
 
             os.remove(file_path)
             file_path = file_path.replace(".nc", ".tiff")
-            driver = gdal.GetDriverByName("netCDF")
+            driver = gdal.GetDriverByName("Gtiff")
             output_dataset = driver.Create(
                 file_path,
                 raster_layer.RasterXSize,
@@ -314,7 +348,13 @@ class ViirsDataset:
 
             return file_path
 
-    def download(self, base_dir:str, date_range:int=5, param:str="ABI-L1b-RadC", process=True):
+    def download(
+        self,
+        base_dir: str,
+        date_range: int = 5,
+        param: str = "ABI-L1b-RadC",
+        process=True,
+    ):
         self.base_dir = base_dir
         if not os.path.exists(self.base_dir):
             os.mkdir(self.base_dir)
@@ -327,16 +367,24 @@ class ViirsDataset:
             self.fit(date)
             self.download_datetime(date, self.download_dir, date_range, param, process)
             self.process_output(self.download_dir)
-            self.patch(date)
+            self.patch(date, win_size=128)
 
-    def download_datetime(self, date:datetime, save_dir:str, date_range:int = 5, param:str="ABI-L1b-RadC", process=True):
-        days_since_year_start = (datetime(date.year, date.month, date.day) - datetime(date.year, 1, 1)).days + 1
+    def download_datetime(
+        self,
+        date: datetime,
+        save_dir: str,
+        date_range: int = 5,
+        param: str = "ABI-L1b-RadC",
+        process=True,
+    ):
+        days_since_year_start = (
+            datetime(date.year, date.month, date.day) - datetime(date.year, 1, 1)
+        ).days + 1
 
         try:
             data_hour = self.fs.ls(
                 f"s3://noaa-goes16/{param}/{date.year}/{str(days_since_year_start).zfill(3)}/{str(date.hour).zfill(2)}"
             )
-
 
             dates = set(
                 map(
@@ -355,7 +403,8 @@ class ViirsDataset:
                 closest_date = date + diff
                 files = list(
                     filter(
-                        lambda x: f"s{closest_date.strftime('%Y%j%H%M%S')}" in x, data_hour
+                        lambda x: f"s{closest_date.strftime('%Y%j%H%M%S')}" in x,
+                        data_hour,
                     )
                 )
 
@@ -365,12 +414,11 @@ class ViirsDataset:
             if process:
                 self.process_dir(save_dir)
 
-
         except Exception as e:
             print(f"Unable to query aws for {str(date).zfill(3)}: {param}")
             raise ValueError(f"Unable to load aws due to {e}")
-            
-    def plot(self, file_name:str):
+
+    def plot(self, file_name: str):
         ds = defaultdict(list)
         for idx, p in enumerate(self._db.labels_):
             ds[p].append(idx)
@@ -383,7 +431,7 @@ class ViirsDataset:
 
             x = [self.filtered_data_points[x].lon for x in v]
             y = [self.filtered_data_points[x].lat for x in v]
-            assert(len(x) == len(y))
+            assert len(x) == len(y)
             k = [k for _ in range(len(x))]
 
             df2 = pd.DataFrame({"lon": x, "lat": y, "key": k})
@@ -399,6 +447,6 @@ class ViirsDataset:
 
 
 if __name__ == "__main__":
-    shapefile = "./files/viirs_data/fire_nrt_J1V-C2_441088.shp"
+    shapefile = "./files/viirs_data/J1_VIIRS_C2_USA_contiguous_and_Hawaii_24h.shp"
     dataset = ViirsDataset(shapefile)
     dataset.download("data", date_range=2)
