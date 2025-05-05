@@ -206,7 +206,6 @@ class ViirsDataset:
         ds = defaultdict(list)
         for idx, p in enumerate(self._db.labels_):
             ds[p].append(idx)
-        pprint(ds)
 
         self.__polygons = []
         for k, v in ds.items():
@@ -221,7 +220,6 @@ class ViirsDataset:
             if len(polygon_points) > 0:
                 hull = ConvexHull(polygon_points)
                 ring = ogr.Geometry(ogr.wkbLinearRing)
-                print("POINTS: ", polygon_points)
 
                 for p in hull.vertices:
                     lon = polygon_points[p][0]
@@ -244,7 +242,6 @@ class ViirsDataset:
 
         feature_defn = mem_layer.GetLayerDefn()
         feature = ogr.Feature(feature_defn)
-        print(multipolygon)
         feature.SetGeometry(multipolygon)
         mem_layer.CreateFeature(feature)
         gdal.RasterizeLayer(
