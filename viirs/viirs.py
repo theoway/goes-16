@@ -1,10 +1,10 @@
 import json
+import logging
 import os
 import random
 from collections import defaultdict
 from datetime import datetime
 from multiprocessing import Pool
-from pprint import pprint
 from typing import Iterable, List
 
 import numpy as np
@@ -13,14 +13,25 @@ import plotly.express as px
 import s3fs
 from netCDF4 import Dataset
 from osgeo import gdal, ogr, osr
+from pyproj import Geod
 from scipy.spatial import ConvexHull
 from sklearn.cluster import DBSCAN
 from tqdm import tqdm
 
+logger = logging.getLogger(__name__)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s \t %(levelname)-8s \t %(message)s",
+    datefmt="%d-%m-%Y %H:%M:%S",
+    filename=f"viirs.log",
+    filemode="w",
+)
+
 
 class ViirsPoint:
     def __init__(
-        self, lat: float, lon: float, brightness: float, frp: float, date: str
+            self, lat: float, lon: float, brightness: float, frp: float, date: str
     ) -> None:
         self.lat = lat
         self.lon = lon
@@ -43,7 +54,7 @@ class ViirsPoint:
 
 class ViirsDataset:
     def __init__(
-        self, dir_location: str, eps: float = 0.01, min_samples: int = 4
+            self, dir_location: str, eps: float = 0.025, min_samples: int = 4
     ) -> None:
         self.fs = s3fs.S3FileSystem(anon=True)
 
@@ -54,6 +65,7 @@ class ViirsDataset:
         self.min_samples = min_samples
 
         self.data_points: List[ViirsPoint] = []
+        self.polygon_areas = []
 
         for idx in range(shape.GetFeatureCount()):
             feature = shape.GetFeature(idx)
@@ -62,6 +74,8 @@ class ViirsDataset:
             self.data_points.append(point)
 
         self.unique_dates = set([p.date for p in self.data_points])
+        logger.info(f"No. of datapoints: {len(self.data_points)}")
+        logger.info(f"Total unique dates: {len(self.unique_dates)}")
 
     def fit(self, date: datetime):
         self.filtered_data_points = list(
@@ -71,6 +85,7 @@ class ViirsDataset:
         self._db = DBSCAN(
             eps=self.eps, min_samples=self.min_samples, algorithm="auto"
         ).fit(tmp_data)
+        logger.info(f"{date} has {len(self.filtered_data_points)} clusters")
 
     def parse_filename(self, filename: str) -> dict:
         if filename.startswith("OR_"):
@@ -180,6 +195,28 @@ class ViirsDataset:
         for file in os.listdir(dir):
             os.remove(os.path.join(dir, file))
 
+    def __is_valid_polygon_points(self, points):
+        """Validate polygon points before creating geometry"""
+        if len(points) < 3:
+            return False
+
+        # Check for NaN or infinite values
+        for point in points:
+            if not all(np.isfinite(coord) for coord in point):
+                return False
+
+        # Check if all points are the same (would create degenerate polygon)
+        if len(set(tuple(p) for p in points)) < 3:
+            return False
+
+        return True
+
+    def __area(self, polygon_point):
+        geod = Geod(ellps="WGS84")
+        lons, lats = zip(*polygon_point)
+        area, _ = geod.polygon_area_perimeter(lons, lats)
+        return abs(area) * 0.000247105
+
     def process_output(self, dir_path: str):
         raster_band_500m = self.__get_band_file(dir_path, 2)
         raster_layer = gdal.Open(os.path.join(dir_path, raster_band_500m))
@@ -217,28 +254,32 @@ class ViirsDataset:
                 for x in v
             ]
 
-            if len(polygon_points) > 0:
-                hull = ConvexHull(polygon_points)
-                ring = ogr.Geometry(ogr.wkbLinearRing)
+            if not self.__is_valid_polygon_points(polygon_points):
+                logger.warning(f"Skipping invalid polygon points for cluster {k}")
+                continue
 
-                for p in hull.vertices:
-                    lon = polygon_points[p][0]
-                    lat = polygon_points[p][1]
-                    lon, lat = self.__convert_WSG__(lat, lon)
-                    ring.AddPoint(lon, lat)
+            hull = ConvexHull(polygon_points)
+            ring = ogr.Geometry(ogr.wkbLinearRing)
 
-                # Complete ring
-                if len(hull.vertices) > 0:
-                    lon = polygon_points[hull.vertices[0]][0]
-                    lat = polygon_points[hull.vertices[0]][1]
-                    lon, lat = self.__convert_WSG__(lat, lon)
-                    ring.AddPoint(lon, lat)
+            hull_points = []
+            for p in hull.vertices:
+                lon = polygon_points[p][0]
+                lat = polygon_points[p][1]
+                transformed_lon, transformed_lat = self.__convert_WSG__(lat, lon)
+                hull_points.append((transformed_lon, transformed_lat))
+                ring.AddPoint(transformed_lon, transformed_lat)
 
-                    poly = ogr.Geometry(ogr.wkbPolygon)
+            # Complete ring
+            if len(hull_points) > 2:
+                ring.AddPoint(hull_points[0][0], hull_points[0][1])
 
-                    poly.AddGeometry(ring)
-                    self.__polygons.append(poly)
-                    multipolygon.AddGeometry(poly)
+                poly = ogr.Geometry(ogr.wkbPolygon)
+                poly.AddGeometry(ring)
+                area = self.__area(polygon_points)
+                logger.info(f"Area is {area}")
+                self.polygon_areas.append(area)
+                self.__polygons.append(poly)
+                multipolygon.AddGeometry(poly)
 
         feature_defn = mem_layer.GetLayerDefn()
         feature = ogr.Feature(feature_defn)
@@ -317,9 +358,9 @@ class ViirsDataset:
             planck_bc1 = ds.variables["planck_bc1"][:]
             planck_bc2 = ds.variables["planck_bc2"][:]
             Field = (
-                planck_fk2 / (np.log((planck_fk1 / ds.variables["Rad"][:]) + 1))
-                - planck_bc1
-            ) / planck_bc2
+                            planck_fk2 / (np.log((planck_fk1 / ds.variables["Rad"][:]) + 1))
+                            - planck_bc1
+                    ) / planck_bc2
 
             os.remove(file_path)
             file_path = file_path.replace(".nc", ".tiff")
@@ -346,11 +387,11 @@ class ViirsDataset:
             return file_path
 
     def download(
-        self,
-        base_dir: str,
-        date_range: int = 5,
-        param: str = "ABI-L1b-RadC",
-        process=True,
+            self,
+            base_dir: str,
+            date_range: int = 5,
+            param: str = "ABI-L1b-RadC",
+            process=True,
     ):
         self.base_dir = base_dir
         if not os.path.exists(self.base_dir):
@@ -360,23 +401,23 @@ class ViirsDataset:
         if not os.path.exists(self.download_dir):
             os.mkdir(self.download_dir)
 
-        for date in self.unique_dates:
+        for date in tqdm(self.unique_dates):
             self.fit(date)
             self.download_datetime(date, self.download_dir, date_range, param, process)
             self.process_output(self.download_dir)
-            self.patch(date, win_size=128)
+            self.patch(date, win_size=64)
 
     def download_datetime(
-        self,
-        date: datetime,
-        save_dir: str,
-        date_range: int = 5,
-        param: str = "ABI-L1b-RadC",
-        process=True,
+            self,
+            date: datetime,
+            save_dir: str,
+            date_range: int = 5,
+            param: str = "ABI-L1b-RadC",
+            process=True,
     ):
         days_since_year_start = (
-            datetime(date.year, date.month, date.day) - datetime(date.year, 1, 1)
-        ).days + 1
+                                        datetime(date.year, date.month, date.day) - datetime(date.year, 1, 1)
+                                ).days + 1
 
         try:
             data_hour = self.fs.ls(
@@ -405,15 +446,18 @@ class ViirsDataset:
                     )
                 )
 
-                assert len(files) == 16
+                if len(files) != 16:
+                    logger.warning(f"{len(files)} present in {closest_date}")
+                    continue
+
+                logger.info(f"Downloading {closest_date}")
                 self.fs.get(files, save_dir)
 
             if process:
                 self.process_dir(save_dir)
 
         except Exception as e:
-            print(f"Unable to query aws for {str(date).zfill(3)}: {param}")
-            raise ValueError(f"Unable to load aws due to {e}")
+            logger.error(f"Unable to query aws for {str(date).zfill(3)}: {param}")
 
     def plot(self, file_name: str):
         ds = defaultdict(list)
@@ -443,7 +487,26 @@ class ViirsDataset:
         fig.write_html(f"data/maps/{file_name}.html")
 
 
+def sort_areas(areas):
+    dictionary = {"small": 0, "medium": 0, "large": 0, "very large": 0}
+    for area in areas:
+        if area < 100:
+            dictionary["small"] += 1
+        elif area > 100 and area < 200:
+            dictionary["medium"] += 1
+        elif area > 200 and area < 500:
+            dictionary["large"] += 1
+        elif area > 500:
+            dictionary["very large"] += 1
+        else:
+            logger.error(f"Unknown area: {area}")
+
+    logger.info(dictionary)
+    return dictionary
+
+
 if __name__ == "__main__":
     shapefile = "./files/viirs_data/J1_VIIRS_C2_USA_contiguous_and_Hawaii_24h.shp"
     dataset = ViirsDataset(shapefile)
-    dataset.download("data", date_range=2)
+    dataset.download("data", date_range=1)
+    area_dictonaries = sort_areas(dataset.polygon_areas)
