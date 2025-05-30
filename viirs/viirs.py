@@ -273,9 +273,11 @@ class ViirsDataset:
             if len(hull_points) > 2:
                 ring.AddPoint(hull_points[0][0], hull_points[0][1])
 
+                area = self.__area(polygon_points)
+                if area < 30:
+                    continue
                 poly = ogr.Geometry(ogr.wkbPolygon)
                 poly.AddGeometry(ring)
-                area = self.__area(polygon_points)
                 logger.info(f"Area is {area}")
                 self.polygon_areas.append(area)
                 self.__polygons.append(poly)
